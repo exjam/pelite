@@ -76,17 +76,17 @@ impl<'a> From<ResourceType> for super::Name<'a> {
 	}
 }
 
-/// Group resources, Icons and Cursors.
+/// Group Icons.
 #[derive(Copy, Clone)]
-pub struct GroupResource<'a> {
+pub struct GroupIcon<'a> {
 	resources: Resources<'a>,
 	image: &'a GRPICONDIR,
 }
-impl<'a> GroupResource<'a> {
+impl<'a> GroupIcon<'a> {
 	/// Parses the GroupResource from the byte slice.
 	///
 	/// The pixel data of the group resource is stored in separate data entries, requiring the resources to access.
-	pub fn new(resources: Resources<'a>, bytes: &'a [u8]) -> Result<GroupResource<'a>, Error> {
+	pub fn new(resources: Resources<'a>, bytes: &'a [u8]) -> Result<GroupIcon<'a>, Error> {
 		if !bytes.as_ptr().aligned_to(2) {
 			return Err(Error::Misaligned);
 		}
@@ -101,7 +101,7 @@ impl<'a> GroupResource<'a> {
 		if bytes.len() != total_size {
 			return Err(Error::Bounds);
 		}
-		Ok(GroupResource { resources, image })
+		Ok(GroupIcon { resources, image })
 	}
 	/// Gets the Group header.
 	pub fn header(&self) -> &'a GRPICONDIR {
@@ -163,9 +163,9 @@ impl<'a> GroupResource<'a> {
 	}
 }
 
-impl fmt::Debug for GroupResource<'_> {
+impl fmt::Debug for GroupIcon<'_> {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-		f.debug_struct("GroupResource")
+		f.debug_struct("GroupIcon")
 			.field("type", &self.ty())
 			.field("entries.len", &self.entries().len())
 			.finish()
@@ -173,7 +173,7 @@ impl fmt::Debug for GroupResource<'_> {
 }
 
 #[cfg(feature = "serde")]
-impl serde::Serialize for GroupResource<'_> {
+impl serde::Serialize for GroupIcon<'_> {
 	fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
 		let mut bytes = Vec::new();
 		mem::forget(self.write(&mut bytes));
@@ -185,10 +185,137 @@ impl serde::Serialize for GroupResource<'_> {
 	}
 }
 
-/// Group Icon.
-pub type GroupIcon<'a> = GroupResource<'a>;
-/// Group Cursor.
-pub type GroupCursor<'a> = GroupResource<'a>;
+/// Group Cursors.
+#[derive(Copy, Clone)]
+pub struct GroupCursor<'a> {
+	resources: Resources<'a>,
+	image: &'a GRPICONDIR,
+}
+impl<'a> GroupCursor<'a> {
+	/// Parses the GroupResource from the byte slice.
+	///
+	/// The pixel data of the group resource is stored in separate data entries, requiring the resources to access.
+	pub fn new(resources: Resources<'a>, bytes: &'a [u8]) -> Result<GroupCursor<'a>, Error> {
+		if !bytes.as_ptr().aligned_to(2) {
+			return Err(Error::Misaligned);
+		}
+		if bytes.len() < mem::size_of::<GRPICONDIR>() {
+			return Err(Error::Bounds);
+		}
+		let image: &'a GRPICONDIR = unsafe { &*(bytes.as_ptr() as *const GRPICONDIR) };
+		if image.idReserved != 0 || !(image.idType == 1 || image.idType == 2) {
+			return Err(Error::BadMagic);
+		}
+		let total_size = mem::size_of::<GRPICONDIR>() + image.idCount as usize * mem::size_of::<GRPCURSORDIRENTRY>();
+		if bytes.len() != total_size {
+			return Err(Error::Bounds);
+		}
+		Ok(GroupCursor { resources, image })
+	}
+	/// Gets the Group header.
+	pub fn header(&self) -> &'a GRPICONDIR {
+		self.image
+	}
+	/// Gets the Group entries.
+	pub fn entries(&self) -> &'a [GRPCURSORDIRENTRY] {
+		let len = self.image.idCount as usize;
+		// Checked by try_from constructor
+		unsafe {
+			let ptr = (self.image as *const GRPICONDIR).offset(1) as *const GRPCURSORDIRENTRY;
+			slice::from_raw_parts(ptr, len)
+		}
+	}
+	/// Gets the Group resource type.
+	pub fn ty(&self) -> ResourceType {
+		match self.image.idType {
+			1 => ResourceType::Icon,
+			2 => ResourceType::Cursor,
+			_ => unreachable!(), // Checked by constructor
+		}
+	}
+	/// Gets the image data for the given icon id.
+	pub fn image(&self, id: u16) -> Result<&'a [u8], FindError> {
+		self.resources.root()?
+			.get_dir(self.ty().into())?
+			.get_dir(id.into())?
+			.first_data()?
+			.bytes().map_err(FindError::Pe)
+	}
+	/// Gets the image data for the given icon id.
+	pub fn hotspot(&self, index: usize) -> Result<(u16, u16), FindError> {
+		let entry = self.entries().get(index).ok_or(FindError::NotFound)?;
+		let hotspot_bytes = self.image(entry.nId)?;
+		Ok((
+			u16::from_le_bytes([hotspot_bytes[0], hotspot_bytes[1]]),
+			u16::from_le_bytes([hotspot_bytes[2], hotspot_bytes[3]]),
+		))
+	}
+	/// Reassemble the file.
+	#[cfg(feature = "std")]
+	pub fn write(&self, dest: &mut dyn io::Write) -> io::Result<()> {
+		// Start by appending the header
+		dest.write(dataview::bytes(self.image))?;
+		// Write all the icon entries
+		let entries = self.entries();
+		let mut image_offset = (6 + entries.len() * 16) as u32;
+		for entry in entries {
+			let bytes_in_resource = entry.bytes_in_resource() - 4;
+			let hotspot_bytes = self.image(entry.nId).unwrap_or(&[0, 0, 0, 0]);
+			let icon_dir_entry = GRPICONDIRENTRY {
+                bWidth: entry.wWidth as u8,
+                bHeight: entry.wWidth as u8,
+                bColorCount: 0,
+                bReserved: 0,
+                wPlanes: u16::from_le_bytes([hotspot_bytes[0], hotspot_bytes[1]]),
+                wBitCount: u16::from_le_bytes([hotspot_bytes[2], hotspot_bytes[3]]),
+                dwBytesInResLo: (bytes_in_resource & 0xffff) as u16,
+                dwBytesInResHi: ((bytes_in_resource >> 16) & 0xffff) as u16,
+                nId: 0, // overwritten by image_offset below
+			};
+
+			// Fixup the dwImageOffset field of the icon entry
+			// NOTE! It is expected that the actual icon data size matches dwBytesInRes information!
+			let mut icon_entry = [0u32; 4];
+			dataview::bytes_mut(&mut icon_entry)[..14].copy_from_slice(dataview::bytes(&icon_dir_entry));
+			icon_entry[3] = image_offset;
+			image_offset += bytes_in_resource;
+			dest.write(dataview::bytes(&icon_entry))?;
+		}
+		// Append the bytes for every entry
+		for entry in entries {
+			// Find the Icon data and append it
+			// FIXME! What do if dwBytesInRes does not match the icon data size?
+			// Ignoring this check may lead to corrupt icon files
+			if let Ok(bytes) = self.image(entry.nId) {
+				// assert_eq!(entry.bytes_in_resource() as usize, bytes.len());
+				dest.write(&bytes[4..])?; // Skip first 4 bytes which are hotspot info
+			}
+		}
+		Ok(())
+	}
+}
+
+impl fmt::Debug for GroupCursor<'_> {
+	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+		f.debug_struct("GroupCursor")
+			.field("type", &self.ty())
+			.field("entries.len", &self.entries().len())
+			.finish()
+	}
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for GroupCursor<'_> {
+	fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+		let mut bytes = Vec::new();
+		mem::forget(self.write(&mut bytes));
+		#[cfg(feature = "data-encoding")]
+		{if serializer.is_human_readable() {
+			return serializer.serialize_str(&data_encoding::BASE64.encode(&bytes));
+		}}
+		serializer.serialize_bytes(&bytes)
+	}
+}
 
 //----------------------------------------------------------------
 
@@ -221,6 +348,23 @@ pub mod image {
 			self.dwBytesInResHi as u32 * 0x10000 + self.dwBytesInResLo as u32
 		}
 	}
+	#[derive(Copy, Clone, Debug)]
+	#[repr(C)]
+	pub struct GRPCURSORDIRENTRY {
+		pub wWidth: u16,
+		pub wHeight: u16,
+		pub wPlanes: u16,
+		pub wBitCount: u16,
+		pub dwBytesInResLo: u16,
+		pub dwBytesInResHi: u16,
+		pub nId: u16,
+	}
+	impl GRPCURSORDIRENTRY {
+		pub fn bytes_in_resource(&self) -> u32 {
+			self.dwBytesInResHi as u32 * 0x10000 + self.dwBytesInResLo as u32
+		}
+	}
 	unsafe impl Pod for GRPICONDIR {}
 	unsafe impl Pod for GRPICONDIRENTRY {}
+	unsafe impl Pod for GRPCURSORDIRENTRY {}
 }
